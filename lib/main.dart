@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 void main() {
   runApp(MyApp());
@@ -24,6 +25,10 @@ class AccessibleFormScreen extends StatefulWidget {
 
 class _AccessibleFormScreenState extends State<AccessibleFormScreen> {
   final FlutterTts flutterTts = FlutterTts();
+  final stt.SpeechToText _speech = stt.SpeechToText();
+  bool _isListening = false;
+  bool _isSpeaking = false;
+  bool _isListeningForCommand = false;
   final _formKey = GlobalKey<FormState>();
 
   // Controladores para los campos de texto
@@ -39,23 +44,156 @@ class _AccessibleFormScreenState extends State<AccessibleFormScreen> {
   void initState() {
     super.initState();
     _initTts();
+    _initSpeech();
+  }
+
+  _initSpeech() async {
+    try {
+      var available = await _speech.initialize(
+        onError: (errorNotification) {
+          print('Error: $errorNotification');
+          setState(() => _isListening = false);
+        },
+        onStatus: (status) {
+          print('Status: $status');
+          if (status == 'done' || status == 'notListening') {
+            setState(() => _isListening = false);
+          }
+        },
+      );
+      if (available) {
+        print("Speech recognition initialized");
+      } else {
+        print("Speech recognition not available");
+      }
+    } catch (e) {
+      print("Error initializing speech: $e");
+    }
+  }
+
+  // Escuchar comandos globales (ej. "enviar formulario") para enviar el formulario
+  Future<void> _startListeningForSubmit() async {
+    // Si se está reproduciendo TTS no iniciar
+    if (_isSpeaking) return;
+
+    // Si ya está en modo comando, detenerlo
+    if (_isListeningForCommand) {
+      setState(() => _isListeningForCommand = false);
+      await _speech.stop();
+      return;
+    }
+
+    // Detener cualquier escucha de campo activa para evitar colisiones
+    if (_isListening) {
+      await _speech.stop();
+      setState(() => _isListening = false);
+    }
+
+    // Inicializar (si necesario) y escuchar
+    var available = await _speech.initialize(
+      onStatus: (status) {
+        print('Command status: $status');
+        if (status == 'done' || status == 'notListening') {
+          setState(() => _isListeningForCommand = false);
+        }
+      },
+      onError: (error) {
+        print('Command error: $error');
+        setState(() => _isListeningForCommand = false);
+      },
+    );
+
+    if (!available) return;
+
+    setState(() => _isListeningForCommand = true);
+
+    await _speech.listen(
+      onResult: (result) async {
+        String recognized = result.recognizedWords;
+        String low = recognized.toLowerCase();
+        print('Command heard: $low');
+
+        // Frases que activan el envío
+        if (low.contains('enviar formulario') ||
+            low.contains('enviar') ||
+            low.contains('envía') ||
+            low.contains('envia')) {
+          // Confirmación por voz y enviar
+          await _speech.stop();
+          setState(() {
+            _isListeningForCommand = false;
+            _isListening = false;
+          });
+          _speak('Enviando formulario');
+          _submitForm();
+        }
+      },
+      localeId: 'es_ES',
+      listenMode: stt.ListenMode.dictation,
+      cancelOnError: true,
+    );
   }
 
   _initTts() async {
     await flutterTts.setLanguage("es-ES");
     await flutterTts.setSpeechRate(0.5);
     await flutterTts.setVolume(1.0);
+
+    // Configurar el callback para cuando termine de hablar
+    flutterTts.setCompletionHandler(() {
+      setState(() {
+        _isSpeaking = false;
+      });
+    });
   }
 
   _speak(String text) async {
     if (text.isNotEmpty) {
+      setState(() => _isSpeaking = true);
+      // Detener cualquier entrada de voz activa
+      if (_isListening) {
+        _speech.stop();
+        setState(() => _isListening = false);
+      }
+      // Asegurarse de que cualquier instancia previa de TTS se detenga
+      await flutterTts.stop();
+      // Hablar el nuevo texto
       await flutterTts.speak(text);
+      // El estado _isSpeaking se actualizará automáticamente cuando termine
+      // gracias al setCompletionHandler configurado en _initTts
     }
   }
 
   // Función para leer la descripción de un campo
   _readFieldDescription(String fieldName, String description) {
     _speak("Campo $fieldName. $description");
+  }
+
+  // Normaliza texto reconocido por voz para formatear correos electrónicos
+  String _normalizeEmailFromSpeech(String input) {
+    if (input.trim().isEmpty) return input;
+
+    String s = input.toLowerCase();
+
+    // Reemplazar signos de puntuación problemáticos (coma, punto y coma) por espacio
+    s = s.replaceAll(RegExp(r"[\,;]"), ' ');
+
+    // Reemplazos de tokens hablados por símbolos
+    s = s.replaceAll(RegExp(r"\barroba\b"), '@');
+    s = s.replaceAll(RegExp(r"\bat\b"), '@');
+    s = s.replaceAll(RegExp(r"\bpunto\b"), '.');
+    s = s.replaceAll(RegExp(r"\bdot\b"), '.');
+    s = s.replaceAll(RegExp(r"\bguion\b"), '-');
+    s = s.replaceAll(RegExp(r"\bguión\b"), '-');
+
+    // Normalizar espacios alrededor de @ y . (por si quedaron separados)
+    s = s.replaceAll(RegExp(r"\s*@\s*"), '@');
+    s = s.replaceAll(RegExp(r"\s*\.\s*"), '.');
+
+    // Eliminar espacios remanentes
+    s = s.replaceAll(RegExp(r"\s+"), '');
+
+    return s;
   }
 
   _submitForm() {
@@ -85,6 +223,15 @@ class _AccessibleFormScreenState extends State<AccessibleFormScreen> {
                   "Formulario de registro. Complete todos los campos marcados como requeridos",
                 ),
             tooltip: 'Leer instrucciones',
+          ),
+          // Botón para activar modo escucha de comando (enviar formulario)
+          IconButton(
+            icon: Icon(_isListeningForCommand ? Icons.mic : Icons.mic_none),
+            onPressed: () => _startListeningForSubmit(),
+            tooltip:
+                _isListeningForCommand
+                    ? 'Detener escucha de comando'
+                    : 'Escuchar comando ("enviar")',
           ),
         ],
       ),
@@ -235,6 +382,44 @@ class _AccessibleFormScreenState extends State<AccessibleFormScreen> {
     );
   }
 
+  Future<void> _startListening(TextEditingController controller) async {
+    if (_isSpeaking) {
+      // No permitir la entrada de voz mientras se están reproduciendo instrucciones
+      return;
+    }
+
+    if (!_isListening) {
+      var available = await _speech.initialize(
+        onStatus: (status) {
+          if (status == 'done') {
+            setState(() => _isListening = false);
+          }
+        },
+      );
+
+      if (available) {
+        setState(() => _isListening = true);
+        await _speech.listen(
+          onResult: (result) {
+            String recognized = result.recognizedWords;
+            String processed = recognized;
+            if (controller == _emailController) {
+              processed = _normalizeEmailFromSpeech(recognized);
+            }
+            setState(() {
+              controller.text = processed;
+            });
+          },
+          localeId: "es_ES",
+          cancelOnError: true,
+        );
+      }
+    } else {
+      setState(() => _isListening = false);
+      await _speech.stop();
+    }
+  }
+
   Widget _buildTextFieldWithSpeech({
     required TextEditingController controller,
     required String label,
@@ -254,7 +439,7 @@ class _AccessibleFormScreenState extends State<AccessibleFormScreen> {
               child: Text(label, style: TextStyle(fontWeight: FontWeight.bold)),
             ),
             IconButton(
-              icon: Icon(Icons.help_outline, size: 18),
+              icon: Icon(Icons.play_arrow, size: 18),
               onPressed: () => _readFieldDescription(fieldName, description),
               tooltip: 'Leer descripción',
             ),
@@ -270,6 +455,25 @@ class _AccessibleFormScreenState extends State<AccessibleFormScreen> {
             hintText: hint,
             border: OutlineInputBorder(),
             contentPadding: EdgeInsets.all(12),
+            suffixIcon: IconButton(
+              icon: Icon(
+                _isListeningForCommand
+                    ? Icons.mic_off
+                    : (_isSpeaking
+                        ? Icons.mic_off
+                        : (_isListening ? Icons.mic : Icons.mic_none)),
+              ),
+              onPressed:
+                  (_isSpeaking || _isListeningForCommand)
+                      ? null
+                      : () => _startListening(controller),
+              tooltip:
+                  _isListeningForCommand
+                      ? 'Modo comando activo - micrófono de campo deshabilitado'
+                      : (_isSpeaking
+                          ? 'Micrófono deshabilitado'
+                          : 'Entrada por voz'),
+            ),
           ),
           onTap: () => _readFieldDescription(fieldName, description),
         ),
@@ -288,7 +492,7 @@ class _AccessibleFormScreenState extends State<AccessibleFormScreen> {
               style: TextStyle(fontWeight: FontWeight.bold),
             ),
             IconButton(
-              icon: Icon(Icons.help_outline, size: 18),
+              icon: Icon(Icons.play_arrow, size: 18),
               onPressed:
                   () => _speak(
                     "Tipo de consulta. Seleccione una opción del menú desplegable",
@@ -355,7 +559,7 @@ class _AccessibleFormScreenState extends State<AccessibleFormScreen> {
           ),
         ),
         IconButton(
-          icon: Icon(Icons.help_outline, size: 18),
+          icon: Icon(Icons.play_arrow, size: 18),
           onPressed:
               () => _speak(
                 "Debe aceptar los términos y condiciones para continuar",
